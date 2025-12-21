@@ -1,191 +1,123 @@
-name: Android Kernel Module Builder (Minimal)
-
-# 极简版：只下载预编译的内核头文件，编译单个模块
-# 适合 GitHub 免费用户，编译时间约 10-30 分钟
+name: Android Kernel Driver Builder
 
 on:
   workflow_dispatch:
     inputs:
+      android_version:
+        description: 'Android Version (Kernel) (e.g., 14)'
+        required: true
       kernel_version:
-        description: 'Kernel Version'
+        description: 'Kernel Version (e.g., 6.1)'
         required: true
-        default: '6.1'
-        type: choice
-        options:
-          - '5.15'
-          - '6.1'
-          - '6.6'
       driver_name:
-        description: 'Driver Module Name (without .ko)'
+        description: 'Driver Module Name (e.g., mydriver.ko)'
         required: true
-        default: 'kernel_hack'
+      target_arch:
+        description: 'Target Architecture (aarch64, x86_64, etc.)'
+        required: true
+        default: 'aarch64'
 
 jobs:
-  build-module:
+  build:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
     
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v4.2.2
+        
+      - name: Prepare kerneldriver directory
+        run: |
+          mkdir kerneldriver
+          mv ./code/*.h ./code/*.c ./code/Makefile kerneldriver/
+          
+      - name: Install repo tool
+        run: |
+          sudo curl -L https://storage.googleapis.com/git-repo-downloads/repo -o /usr/local/bin/repo
+          sudo chmod a+x /usr/local/bin/repo
 
-      - name: Install build dependencies
+      - name: Set up Android Kernel source
+        run: |
+          mkdir -p android-kernel && cd android-kernel
+          repo init -u https://android.googlesource.com/kernel/manifest -b common-android${{ github.event.inputs.android_version }}-${{ github.event.inputs.kernel_version }}
+          repo sync -j$(nproc) -c --no-tags --optimized-fetch --force-sync
+
+      - name: Copy kerneldriver
+        run: |
+          cd android-kernel
+          cp -r ../kerneldriver common/drivers
+
+      - name: Modify Makefile
+        run: |
+          cd android-kernel
+          echo "obj-y += kerneldriver/" >> common/drivers/Makefile
+
+      - name: Add module to GKI modules list
+        if: ${{ github.event.inputs.android_version > 13 }}
+        run: |
+          cd android-kernel
+          MODULE_NAME="drivers/kerneldriver/${{ github.event.inputs.driver_name }}"
+          
+          awk -i inplace -v module="$MODULE_NAME" '
+            BEGIN { added=0 }
+            /_COMMON_GKI_MODULES_LIST = \[/ { in_list=1 }
+            in_list && /\]/ {
+              if (!added) {
+                print "    \"" module "\","
+                added=1
+              }
+              in_list=0
+            }
+            in_list && !added {
+              if (module < $0) {
+                print "    \"" module "\","
+                added=1
+              }
+            }
+            { print }
+          ' common/modules.bzl
+          
+      - name: Prepare module list for legacy builds
+        if: ${{ github.event.inputs.android_version <= 13 }}
+        run: |
+          cd android-kernel
+          echo "drivers/kerneldriver/${{ github.event.inputs.driver_name }}" >> common/android/gki_${{ github.event.inputs.target_arch }}_modules
+      - name: Increase stack frame size limit
+        run: |
+          cd android-kernel
+          find . -type f -name "Makefile*" -exec sed -i 's/-Wframe-larger-than=[0-9]*/-Wframe-larger-than=4096/g' {} +
+          grep -q "FRAME_WARN" common/Makefile || echo 'KBUILD_CFLAGS += -Wframe-larger-than=4096' >> common/Makefile
+
+      - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            build-essential \
-            flex \
-            bison \
-            libssl-dev \
-            libelf-dev \
-            bc \
-            python3 \
-            python-is-python3 \
-            git \
-            curl \
-            wget \
-            kmod \
-            cpio \
-            zstd \
-            llvm \
-            clang \
-            lld
-
-      - name: Setup Android NDK (for cross-compilation)
+          sudo apt-get install -y build-essential flex bison libssl-dev libelf-dev bc python-is-python3
+      - name: Fix missing kprobe symbols for Android 13
+        if: ${{ github.event.inputs.android_version == 13 }}
         run: |
-          wget -q https://dl.google.com/android/repository/android-ndk-r26c-linux.zip
-          unzip -q android-ndk-r26c-linux.zip
-          export NDK_PATH=$PWD/android-ndk-r26c
-          echo "NDK_PATH=$NDK_PATH" >> $GITHUB_ENV
-          echo "$NDK_PATH/toolchains/llvm/prebuilt/linux-x86_64/bin" >> $GITHUB_PATH
-
-      - name: Download prebuilt kernel headers
-        run: |
-          mkdir -p kernel-headers
-          cd kernel-headers
+          cd android-kernel
+          for symbol in register_kprobe unregister_kprobe; do
+            grep -q "$symbol" common/android/abi_gki_${{ github.event.inputs.target_arch }} || \
+            echo "$symbol" >> common/android/abi_gki_${{ github.event.inputs.target_arch }}
+          done
+          sed -i '/EXPORT_SYMBOL(unregister_kprobe);/a EXPORT_SYMBOL(register_kprobe);' common/kernel/kprobes.c
           
-          KERNEL_VER="${{ github.event.inputs.kernel_version }}"
-          
-          case $KERNEL_VER in
-            "5.15")
-              BRANCH="android13-5.15"
-              ;;
-            "6.1")
-              BRANCH="android14-6.1"
-              ;;
-            "6.6")
-              BRANCH="android15-6.6"
-              ;;
-          esac
-          
-          echo "Downloading kernel headers for $BRANCH..."
-          
-          git clone --depth=1 --single-branch \
-            -b common-$BRANCH \
-            https://android.googlesource.com/kernel/common \
-            kernel-source
-          
-          echo "=== Kernel source downloaded ==="
-          ls -la kernel-source/
-
-      - name: Prepare driver source
-        env:
-          DRIVER_NAME: ${{ github.event.inputs.driver_name }}
-        run: |
-          mkdir -p driver-src
-          
-          if [ -d "./code" ]; then
-            cp ./code/*.c ./code/*.h driver-src/ 2>/dev/null || true
-          fi
-          
-          if [ ! -f "driver-src/${DRIVER_NAME}.c" ]; then
-            echo "Creating sample driver..."
-            cat > "driver-src/${DRIVER_NAME}.c" <<'CEOF'
-#include <linux/module.h>
-#include <linux/kernel.h>
-#include <linux/init.h>
-
-MODULE_LICENSE("GPL");
-MODULE_AUTHOR("Builder");
-MODULE_DESCRIPTION("Sample Kernel Module");
-
-static int __init sample_init(void)
-{
-    printk(KERN_INFO "Module loaded\n");
-    return 0;
-}
-
-static void __exit sample_exit(void)
-{
-    printk(KERN_INFO "Module unloaded\n");
-}
-
-module_init(sample_init);
-module_exit(sample_exit);
-CEOF
-          fi
-          
-          cat > driver-src/Makefile <<MEOF
-obj-m += ${DRIVER_NAME}.o
-
-KERNEL_SRC ?= ../kernel-headers/kernel-source
-
-all:
-	\$(MAKE) -C \$(KERNEL_SRC) M=\$(PWD) modules ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- LLVM=1
-
-clean:
-	\$(MAKE) -C \$(KERNEL_SRC) M=\$(PWD) clean
-MEOF
-          
-          echo "=== Driver source ==="
-          ls -la driver-src/
-
-      - name: Configure kernel for module build
-        run: |
-          cd kernel-headers/kernel-source
-          
-          make ARCH=arm64 LLVM=1 gki_defconfig || make ARCH=arm64 LLVM=1 defconfig
-          
-          scripts/config --enable CONFIG_MODULES
-          scripts/config --enable CONFIG_MODULE_UNLOAD
-          
-          make ARCH=arm64 LLVM=1 modules_prepare -j$(nproc)
-          
-          echo "=== Kernel configured ==="
-
       - name: Build kernel module
         run: |
-          cd driver-src
-          
-          export ARCH=arm64
-          export CROSS_COMPILE=aarch64-linux-gnu-
-          export LLVM=1
-          
-          make KERNEL_SRC=../kernel-headers/kernel-source -j$(nproc)
-          
-          echo "=== Build result ==="
-          ls -la *.ko 2>/dev/null || echo "No .ko files found"
-
-      - name: Collect artifacts
-        run: |
-          mkdir -p output
-          find . -name "*.ko" -type f -exec cp {} output/ \;
-          
-          echo "=== Output files ==="
-          ls -la output/
-          
-          for ko in output/*.ko; do
-            if [ -f "$ko" ]; then
-              echo "=== Module info: $ko ==="
-              file "$ko"
-              modinfo "$ko" 2>/dev/null || true
-            fi
-          done
-
-      - name: Upload kernel module
-        uses: actions/upload-artifact@v4
+          cd android-kernel
+          if [ ${{ github.event.inputs.android_version }} -le 13 ]; then
+            BUILD_CONFIG=common/build.config.gki.${{ github.event.inputs.target_arch }} LTO=thin build/build.sh -j32
+            OUTPUT_PATH="out/android${{ github.event.inputs.android_version }}-${{ github.event.inputs.kernel_version }}/dist"
+          else
+            echo "Using Bazel build system for Android ${{ github.event.inputs.android_version }}"
+            tools/bazel run //common:kernel_${{ github.event.inputs.target_arch }}_dist
+            OUTPUT_PATH="out/kernel_${{ github.event.inputs.target_arch }}"
+          fi
+          echo "OUTPUT_PATH=$OUTPUT_PATH" >> $GITHUB_ENV
+        continue-on-error: true
+      
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4.6.2
         with:
-          name: ${{ github.event.inputs.driver_name }}-kernel${{ github.event.inputs.kernel_version }}-arm64
-          path: output/*.ko
-          retention-days: 30
-          if-no-files-found: warn
+          name: kernel-driver-${{ github.event.inputs.target_arch }}
+          path: |
+            android-kernel/${{ env.OUTPUT_PATH }}

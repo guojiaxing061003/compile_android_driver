@@ -144,9 +144,21 @@ jobs:
           echo "OUTPUT_PATH=$OUTPUT_PATH" >> $GITHUB_ENV
         continue-on-error: true
       
+      - name: Clean and compress output
+        run: |
+          cd android-kernel/${{ env.OUTPUT_PATH }}
+          echo "=== 清理中间文件 ==="
+          find . -name "*.o" -delete
+          find . -name "*.cmd" -delete
+          find . -name "*.d" -delete
+          echo "=== 压缩输出目录 ==="
+          cd ..
+          tar -czvf kernel-output-${{ github.event.inputs.target_arch }}.tar.gz $(basename ${{ env.OUTPUT_PATH }})
+          mv kernel-output-${{ github.event.inputs.target_arch }}.tar.gz $GITHUB_WORKSPACE/
+          ls -lh $GITHUB_WORKSPACE/kernel-output-${{ github.event.inputs.target_arch }}.tar.gz
+
       - name: Upload artifacts
         uses: actions/upload-artifact@v4.6.2
         with:
           name: kernel-driver-${{ github.event.inputs.target_arch }}
-          path: |
-            android-kernel/${{ env.OUTPUT_PATH }}
+          path: kernel-output-${{ github.event.inputs.target_arch }}.tar.gz

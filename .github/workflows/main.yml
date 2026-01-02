@@ -57,8 +57,8 @@ jobs:
       - name: Set up Android Kernel source
         run: |
           mkdir -p android-kernel && cd android-kernel
-          repo init -u https://android.googlesource.com/kernel/manifest -b common-android${{ github.event.inputs.android_version }}-${{ github.event.inputs.kernel_version }} --depth=1
-          repo sync -j$(nproc) -c --no-tags --optimized-fetch --force-sync --depth=1
+          repo init -u https://android.googlesource.com/kernel/manifest -b common-android${{ github.event.inputs.android_version }}-${{ github.event.inputs.kernel_version }}
+          repo sync -j$(nproc) -c --no-tags --optimized-fetch --force-sync --current-branch
 
       # repo sync 完成后删除 .repo 目录节省空间
       - name: Clean up repo metadata
